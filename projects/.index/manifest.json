@@ -1,0 +1,10 @@
+{
+  "project_path": "projects",
+  "indexed_at": "1773354980.288297",
+  "embed_model": "nomic-embed-text",
+  "chunk_size_tokens": 512,
+  "chunk_overlap_tokens": 50,
+  "total_files": 3,
+  "total_chunks": 10,
+  "failed_files": []
+}
