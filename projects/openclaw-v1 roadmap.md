@@ -150,10 +150,10 @@ NAMED MEMORIES
 
 ### Phase 1: Memory First (Start Here)
 Memory is the foundation — everything else relies on memory
-1. Define memory architecture
-2. Implement short-term
-3. Implement mid-term
-4. Implement long-term with compaction
+1. Define memory architecture ✅
+2. Implement short-term ✅
+3. Implement mid-term ✅
+4. Implement long-term with compaction ✅ (v1.0 basic)
 
 ### Phase 2: Internet Access
 Once memory exists, research becomes useful
