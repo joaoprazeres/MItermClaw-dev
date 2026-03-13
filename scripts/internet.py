@@ -148,6 +148,155 @@ def fetch_content(urls: List[str], max_chars: int = 8000) -> Dict[str, str]:
     return results
 
 
+# ============== Compression Helpers ==============
+
+def count_tokens(text: str) -> int:
+    """Rough token estimation (~4 chars per token)."""
+    return len(text) // 4
+
+
+def summarize_iterations(iterations_data: list, keep_last: int = 1) -> str:
+    """
+    Compress old iterations into a summary.
+    
+    Args:
+        iterations_data: List of iteration dicts
+        keep_last: Number of recent iterations to keep fully
+    
+    Returns:
+        Summary string of old iterations
+    """
+    if len(iterations_data) <= keep_last:
+        return ""
+    
+    # Keep last N iterations fully
+    recent = iterations_data[-keep_last:]
+    old = iterations_data[:-keep_last]
+    
+    if not old:
+        return ""
+    
+    # Summarize old iterations
+    summary = "Previous Research Summary:\n"
+    for iter_data in old:
+        iter_num = iter_data.get("iteration", "?")
+        query = iter_data.get("query", "")
+        response = iter_data.get("llm_response", "No response")[:200]
+        sources = [r.get("title", "") for r in iter_data.get("search_results", [])[:3]]
+        
+        summary += f"\n- Iteration {iter_num}: '{query}' → {response}..."
+        if sources:
+            summary += f" (Sources: {', '.join(sources[:2])})"
+    
+    return summary
+
+
+def compress_context(context: str, max_tokens: int = 3000) -> str:
+    """
+    Compress context if it exceeds token limit.
+    
+    Args:
+        context: Full context string
+        max_tokens: Maximum tokens to keep
+    
+    Returns:
+        Compressed context
+    """
+    tokens = count_tokens(context)
+    
+    if tokens <= max_tokens:
+        return context
+    
+    # If too long, truncate but keep beginning and end (most important)
+    # Keep ~60% from start, 40% from end
+    chars_limit = max_tokens * 4
+    
+    if len(context) > chars_limit:
+        start_portion = int(chars_limit * 0.6)
+        end_portion = chars_limit - start_portion
+        
+        start = context[:start_portion]
+        end = context[-end_portion:] if end_portion > 0 else ""
+        
+        return f"{start}\n\n[... content truncated ...]\n\n{end}"
+    
+    return context
+
+
+# ============== OPTION 3: Session-Level Compression ==============
+
+def compress_messages(messages: list, max_tokens: int = 3500) -> list:
+    """
+    Compress a list of chat messages for session continuity.
+    
+    Strategy:
+    1. Keep system prompt
+    2. Keep recent messages (last 4)
+    3. Summarize older messages into a compact summary
+    
+    Args:
+        messages: List of message dicts with 'role' and 'content'
+        max_tokens: Target max tokens for compressed history
+    
+    Returns:
+        Compressed messages list
+    """
+    if not messages:
+        return messages
+    
+    # Find system message
+    system_msg = None
+    non_system = []
+    
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_msg = msg
+        else:
+            non_system.append(msg)
+    
+    # Keep last 4 messages fully
+    KEEP_RECENT = 4
+    if len(non_system) <= KEEP_RECENT + 1:
+        # Not too many messages, return as-is
+        return messages
+    
+    recent = non_system[-KEEP_RECENT:]
+    old = non_system[:-KEEP_RECENT]
+    
+    # Summarize old messages
+    old_text = "\n".join([
+        f"{m['role']}: {m['content'][:150]}..." if len(m.get('content', '')) > 150 else f"{m['role']}: {m['content']}"
+        for m in old
+    ])
+    
+    # Create summary of old messages
+    summary_prompt = f"Compress this chat history into a brief summary:\n\n{old_text[:2000]}"
+    summary = call_llm(summary_prompt, "Summarize briefly. Include key topics and any important conclusions.")
+    
+    # Build compressed messages
+    compressed = []
+    if system_msg:
+        compressed.append(system_msg)
+    
+    compressed.append({
+        "role": "system",
+        "content": f"[Previous conversation summary: {summary[:300] if summary else 'Earlier chat'}]"
+    })
+    
+    compressed.extend(recent)
+    
+    return compressed
+
+
+def estimate_session_tokens(messages: list) -> int:
+    """Estimate total tokens in a message session."""
+    total = 0
+    for msg in messages:
+        content = msg.get("content", "")
+        total += count_tokens(content)
+    return total
+
+
 # ============== Helper: LLM Interaction ==============
 
 def call_llm(prompt: str, system_prompt: str = "You are a helpful assistant.") -> Optional[str]:
@@ -233,9 +382,21 @@ def research_loop(query: str, max_iterations: int = 3) -> Dict[str, Any]:
         print(f"Fetching: {urls}")
         content_map = fetch_content(urls)
         
+        # OPTION 2: Compress previous iterations for this research loop
+        research_summary = ""
+        if i > 0:
+            # Summarize old iterations, keep last one fully
+            research_summary = summarize_iterations(iterations_data, keep_last=1)
+        
         # Prepare context for LLM
         context = f"Research Query: {current_query}\n\n"
-        context += "Search Results:\n"
+        
+        # Add compressed summary from previous iterations
+        if research_summary:
+            context += f"{research_summary}\n\n"
+            context += "---\n\n"
+        
+        context += "Current Search Results:\n"
         for idx, result in enumerate(search_results):
             context += f"\n[{idx+1}] {result['title']}\n"
             context += f"URL: {result['url']}\n"
@@ -243,7 +404,10 @@ def research_loop(query: str, max_iterations: int = 3) -> Dict[str, Any]:
         
         context += "\n\nFetched Content:\n"
         for url, content in content_map.items():
-            context += f"\n--- {url} ---\n{content[:1000]}\n"
+            context += f"\n--- {url} ---\n{content[:800]}\n"
+        
+        # Compress context if too long
+        context = compress_context(context, max_tokens=3000)
         
         # Step 3: LLM Analyze
         analysis_prompt = f"""You are researching: {query}
