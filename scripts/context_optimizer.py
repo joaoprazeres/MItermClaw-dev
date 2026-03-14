@@ -11,10 +11,21 @@ import os
 import subprocess
 from typing import Optional
 
-# Config
+# Config - HYBRID CONTEXT OPTIMIZER
 CONTEXT_THRESHOLD = 80  # % of context to trigger check
+WARN_THRESHOLD = 50  # % - warn user
+ACTION_THRESHOLD = 70  # % - auto-trigger action
 TOPIC_SHIFT_THRESHOLD = 0.35  # similarity below = topic shift
 MAX_CONTEXT_TOKENS = 128000
+
+# Check frequency
+CHECK_EVERY_MESSAGES = 10
+CHECK_EVERY_SECONDS = 300  # 5 minutes
+
+# Directories
+MEMORY_DIR = "/data/data/com.termux/files/home/.openclaw/workspace/memory"
+SUMMARIZED_DIR = f"{MEMORY_DIR}/summarized"
+ARCHIVED_SESSIONS_DIR = f"{MEMORY_DIR}/sessions/archived"
 
 def get_sessions_json() -> dict:
     """Get session info from openclaw."""
@@ -335,6 +346,169 @@ def detect_topic_shift_llm(agent_id: str = "main") -> dict:
         "session_path": session_path
     }
 
+def summarize_old_messages(agent_id: str = "main", keep_last: int = 50) -> dict:
+    """
+    Summarize old messages and save to file.
+    Keeps last N messages in active context, summarizes older ones.
+    
+    Returns: {"success": bool, "summary": str, "tokens_freed": int, "file": str}
+    """
+    import datetime
+    
+    session_path = get_current_session_path(agent_id)
+    if not session_path:
+        return {"success": False, "summary": "No active session found", "tokens_freed": 0, "file": ""}
+    
+    all_messages = read_session_messages(session_path)
+    
+    if len(all_messages) <= keep_last:
+        return {"success": False, "summary": f"Only {len(all_messages)} messages, not trimming", "tokens_freed": 0, "file": ""}
+    
+    # Split: messages to summarize vs keep
+    messages_to_summarize = all_messages[:-keep_last]
+    messages_to_keep = all_messages[-keep_last:]
+    
+    # Generate summary using LLM
+    content_for_summary = "\n\n".join([
+        f"[{m['role']}]: {m['content'][:500]}{'...' if len(m['content']) > 500 else ''}"
+        for m in messages_to_summarize[:30]  # Limit to avoid token overflow
+    ])
+    
+    summarize_prompt = f"""Summarize this conversation concisely. Capture:
+- Main topics discussed
+- Key decisions made
+- Important context for future reference
+
+CONVERSATION:
+{content_for_summary}
+
+Provide a concise summary (3-5 sentences max):"""
+    
+    summary = call_llm(summarize_prompt)
+    
+    # Estimate tokens saved (rough: ~4 chars per token)
+    chars_summarized = sum(len(m['content']) for m in messages_to_summarize)
+    tokens_freed = chars_summarized // 4
+    
+    # Save to file
+    date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    summary_file = f"{SUMMARIZED_DIR}/{date_str}.json"
+    
+    summary_data = {
+        "date": date_str,
+        "agent": agent_id,
+        "summary": summary,
+        "message_count": len(messages_to_summarize),
+        "tokens_freed": tokens_freed,
+        "session_file": session_path
+    }
+    
+    # Append to existing or create new
+    existing = []
+    if os.path.exists(summary_file):
+        try:
+            with open(summary_file, 'r') as f:
+                existing = json.load(f)
+        except:
+            existing = []
+    
+    if isinstance(existing, list):
+        existing.append(summary_data)
+    else:
+        existing = [summary_data]
+    
+    os.makedirs(SUMMARIZED_DIR, exist_ok=True)
+    with open(summary_file, 'w') as f:
+        json.dump(existing, f, indent=2)
+    
+    return {
+        "success": True,
+        "summary": summary,
+        "tokens_freed": tokens_freed,
+        "file": summary_file,
+        "messages_archived": len(messages_to_summarize),
+        "messages_kept": len(messages_to_keep)
+    }
+
+
+def archive_session(agent_id: str = "main", archive_name: str = None) -> dict:
+    """
+    Archive current session to a backup file.
+    
+    Returns: {"success": bool, "archive_path": str}
+    """
+    import datetime
+    
+    session_path = get_current_session_path(agent_id)
+    if not session_path:
+        return {"success": False, "archive_path": "", "reason": "No session found"}
+    
+    os.makedirs(ARCHIVED_SESSIONS_DIR, exist_ok=True)
+    
+    if not archive_name:
+        date_str = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        archive_name = f"{agent_id}_{date_str}.jsonl"
+    
+    archive_path = f"{ARCHIVED_SESSIONS_DIR}/{archive_name}"
+    
+    try:
+        import shutil
+        shutil.copy2(session_path, archive_path)
+        
+        # Also save metadata
+        metadata_path = archive_path + ".meta.json"
+        metadata = {
+            "archived_at": datetime.datetime.now().isoformat(),
+            "original_path": session_path,
+            "agent": agent_id,
+            "message_count": len(read_session_messages(session_path))
+        }
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        return {"success": True, "archive_path": archive_path}
+    except Exception as e:
+        return {"success": False, "archive_path": "", "reason": str(e)}
+
+
+def check_and_optimize(agent_id: str = "main") -> dict:
+    """
+    Main optimization check - hybrid approach.
+    Checks context levels and takes appropriate action based on thresholds.
+    
+    Returns: {"action": str, "details": dict}
+    """
+    input_tokens, context_limit = get_current_session_tokens(agent_id)
+    usage_pct = calculate_usage_pct(input_tokens, context_limit)
+    
+    result = {
+        "agent": agent_id,
+        "usage_pct": usage_pct,
+        "input_tokens": input_tokens,
+        "context_limit": context_limit,
+        "action": "none",
+        "details": {}
+    }
+    
+    if usage_pct >= ACTION_THRESHOLD:
+        # High usage - take action
+        result["action"] = "summarize_and_archive"
+        result["details"] = summarize_old_messages(agent_id, keep_last=50)
+        
+        if not result["details"].get("success"):
+            # Fallback: just archive
+            result["details"]["fallback"] = archive_session(agent_id)
+            
+    elif usage_pct >= WARN_THRESHOLD:
+        result["action"] = "warn"
+        result["details"] = {
+            "message": f"Context at {usage_pct:.1f}%",
+            "recommendation": "Consider running compaction"
+        }
+    
+    return result
+
+
 def summarize_old_context() -> str:
     """
     Summarize old context to free up tokens.
@@ -385,8 +559,11 @@ def main():
         print("Commands:")
         print("  status              - Check context usage")
         print("  check               - Check and auto-compact if needed")
+        print("  check-optimize      - Hybrid optimization (warn at 50%, act at 70%)")
         print("  detect-topic [agent] - Detect topic shift (default: main)")
         print("  compact <level>    - Run compaction (1-3)")
+        print("  summarize [agent]  - Summarize old messages, keep last 50")
+        print("  archive [agent]    - Archive session to backup")
         sys.exit(1)
     
     cmd = sys.argv[1]
@@ -407,6 +584,21 @@ def main():
                 print(json.dumps(result, indent=2))
             else:
                 print(f"✅ {agent['agent']}: {agent['usage_pct']:.1f}% - OK")
+                
+    elif cmd == "check-optimize":
+        # Hybrid auto-optimization
+        result = check_and_optimize(agent_id)
+        print(json.dumps(result, indent=2))
+        
+    elif cmd == "summarize":
+        # Manual summarize old messages
+        result = summarize_old_messages(agent_id, keep_last=50)
+        print(json.dumps(result, indent=2))
+        
+    elif cmd == "archive":
+        # Manual archive session
+        result = archive_session(agent_id)
+        print(json.dumps(result, indent=2))
                 
     elif cmd == "detect-topic":
         result = detect_topic_shift_llm(agent_id)
